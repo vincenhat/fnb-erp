@@ -1,0 +1,228 @@
+// Prisma schema for F&B ERP
+// Reference: docs/double-entry.md
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// =====================================================
+// Tenancy & Identity
+// =====================================================
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  taxCode   String?  @map("tax_code")
+  // Vietnam accounting system: TT200 or TT133
+  accountingScheme AccountingScheme @default(TT200) @map("accounting_scheme")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  branches      Branch[]
+  users         UserOrganization[]
+  accounts      Account[]
+  journals      JournalEntry[]
+  auditLogs     AuditLog[]
+
+  @@map("organizations")
+}
+
+enum AccountingScheme {
+  TT200
+  TT133
+
+  @@map("accounting_scheme")
+}
+
+model Branch {
+  id             String   @id @default(cuid())
+  organizationId String   @map("organization_id")
+  name           String
+  code           String
+  address        String?
+  phone          String?
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  members      BranchMembership[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+  @@map("branches")
+}
+
+// User profile mirrored from Clerk via webhook.
+model User {
+  id        String   @id @default(cuid())
+  // Clerk user id (e.g. user_xxx)
+  clerkId   String   @unique @map("clerk_id")
+  email     String   @unique
+  fullName  String?  @map("full_name")
+  imageUrl  String?  @map("image_url")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  organizations UserOrganization[]
+  branches      BranchMembership[]
+  auditLogs     AuditLog[]
+
+  @@map("users")
+}
+
+model UserOrganization {
+  id             String       @id @default(cuid())
+  userId         String       @map("user_id")
+  organizationId String       @map("organization_id")
+  role           SystemRole   @default(STAFF)
+  createdAt      DateTime     @default(now()) @map("created_at")
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+  @@map("user_organizations")
+}
+
+model BranchMembership {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  branchId  String   @map("branch_id")
+  role      SystemRole
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, branchId])
+  @@index([branchId])
+  @@map("branch_memberships")
+}
+
+// Coarse system role. Fine-grained permissions are computed via CASL abilities
+// in lib/abilities.ts based on this role + branch context.
+enum SystemRole {
+  OWNER
+  MANAGER
+  ACCOUNTANT
+  CASHIER
+  KITCHEN
+  STAFF
+
+  @@map("system_role")
+}
+
+// =====================================================
+// Accounting (double-entry, TT200/TT133 compatible)
+// =====================================================
+
+model Account {
+  id             String      @id @default(cuid())
+  organizationId String      @map("organization_id")
+  // Vietnam chart-of-accounts code, e.g. "111", "1111", "5111"
+  code           String
+  name           String
+  type           AccountType
+  // Debit-normal (true) vs credit-normal (false). Used to compute balances.
+  debitNormal    Boolean     @map("debit_normal")
+  parentId       String?     @map("parent_id")
+  isActive       Boolean     @default(true) @map("is_active")
+  createdAt      DateTime    @default(now()) @map("created_at")
+  updatedAt      DateTime    @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  parent       Account?     @relation("AccountTree", fields: [parentId], references: [id])
+  children     Account[]    @relation("AccountTree")
+  lines        JournalLine[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId, type])
+  @@map("accounts")
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+
+  @@map("account_type")
+}
+
+// A balanced journal entry: sum(debit) == sum(credit) across its lines.
+// Higher-level documents (Order, Invoice, Payroll, ...) post one or more
+// JournalEntry records as side effects of business transactions.
+model JournalEntry {
+  id             String   @id @default(cuid())
+  organizationId String   @map("organization_id")
+  // Business date (may differ from createdAt)
+  postedAt       DateTime @map("posted_at")
+  // Free-text reference, e.g. "ORDER:ord_123" or "INV:inv_456"
+  reference      String?
+  description    String?
+  // Optional source document for traceability (polymorphic via type+id)
+  sourceType     String?  @map("source_type")
+  sourceId       String?  @map("source_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  lines        JournalLine[]
+
+  @@index([organizationId, postedAt])
+  @@index([sourceType, sourceId])
+  @@map("journal_entries")
+}
+
+// One side of a journal entry. Amounts are stored in BIGINT cents (VND has no
+// fractional unit by default; we still normalise to cents for cross-currency
+// support and to avoid floating-point math). debitCents and creditCents are
+// mutually exclusive: exactly one is non-zero per row.
+model JournalLine {
+  id             String   @id @default(cuid())
+  journalEntryId String   @map("journal_entry_id")
+  accountId      String   @map("account_id")
+  // Amounts in minor units (cents). VND base unit treated as 1 cent.
+  debitCents     BigInt   @default(0) @map("debit_cents")
+  creditCents    BigInt   @default(0) @map("credit_cents")
+  description    String?
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  journalEntry JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
+  account      Account      @relation(fields: [accountId], references: [id])
+
+  @@index([journalEntryId])
+  @@index([accountId])
+  @@map("journal_lines")
+}
+
+// =====================================================
+// Audit
+// =====================================================
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String   @map("organization_id")
+  userId         String?  @map("user_id")
+  action         String
+  resourceType   String   @map("resource_type")
+  resourceId     String   @map("resource_id")
+  metadata       Json?
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@index([resourceType, resourceId])
+  @@map("audit_logs")
+}
